@@ -1,0 +1,36 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+FILE_PATH = '/marketing_campaign_data_messy.csv'
+
+try:
+    df = pd.read_csv(FILE_PATH, encoding='utf-8')
+except UnicodeDecodeError:
+    df = pd.read_csv(FILE_PATH, encoding='ISO-8859-1')
+
+df_clean = df.copy()
+
+df_clean = df_clean.drop_duplicates(keep='first')
+
+numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+for col in numeric_cols:
+    df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+
+categorical_cols = df_clean.select_dtypes(include=['object']).columns
+for col in categorical_cols:
+    df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+    df_clean[col] = df_clean[col].str.strip().str.lower()
+    le = LabelEncoder()
+    df_clean[col] = le.fit_transform(df_clean[col].astype(str))
+
+for col in numeric_cols:
+    Q1 = df_clean[col].quantile(0.25)
+    Q3 = df_clean[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    df_clean[col] = df_clean[col].clip(lower=lower_bound, upper=upper_bound)
+
+df_clean.to_csv('cleaned_marketing_campaign_data.csv', index=False)
+print("清洗完成，保存为 cleaned_marketing_campaign_data.csv")
