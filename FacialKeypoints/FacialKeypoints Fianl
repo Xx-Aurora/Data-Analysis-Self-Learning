@@ -1,0 +1,141 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# 中位数填充缺失的关键点坐标
+df = pd.read_csv('training.csv')
+target_cols = [c for c in df.columns if c != 'Image']
+y = df[target_cols].values.astype(np.float32)
+y = pd.DataFrame(y).fillna(pd.DataFrame(y).median()).values
+
+#  归一化
+def parse_pixel_string(s):
+    return np.array([int(x) for x in s.split()], dtype=np.float32) / 255.0
+
+X = np.stack(df['Image'].apply(parse_pixel_string).values)
+X = X.reshape(-1, 96, 96)
+
+# 训练/验证集划分
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+#
+class FacialKeypointsDataset(Dataset):
+    def __init__(self, X, y, transform=None):
+        self.X = X
+        self.y = y
+        self.transform = transform
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, idx):
+        img = self.X[idx]
+        kps = self.y[idx].copy()
+        if self.transform:
+            kps_reshaped = kps.reshape(-1, 2)
+            augmented = self.transform(image=img, keypoints=kps_reshaped)
+            img = augmented['image']
+            kps = np.array(augmented['keypoints']).flatten()
+        # 归一化到 [-0.5, 0.5]
+        kps = (kps - 48.0) / 96.0
+        return img, torch.tensor(kps, dtype=torch.float32)
+
+# 训练增强：几何变换 + 亮度/对比度 + 噪声，输入 resize 到 224
+train_aug = A.Compose([
+    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485], std=[0.229]),
+    ToTensorV2()
+], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+# 验证时只 resize + 归一化
+val_aug = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485], std=[0.229]),
+    ToTensorV2()
+], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+train_ds = FacialKeypointsDataset(X_train, y_train, transform=train_aug)
+val_ds = FacialKeypointsDataset(X_val, y_val, transform=val_aug)
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0)
+
+# 使用 ResNet50 作为骨干，修改输入通道为1  （灰度
+class KeypointModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.features = nn.Sequential(*list(backbone.children())[:-1])
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(2048, 30)   # 输出30个坐标
+    def forward(self, x):
+        x = self.features(x)
+        x = x.flatten(1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = KeypointModel().to(device)
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+EPOCHS = 100
+best_rmse_pixel = float('inf')
+patience_counter = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss = 0.0
+    loop = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS}')
+    for img, kps in loop:
+        img, kps = img.to(device), kps.to(device)
+        optimizer.zero_grad()
+        out = model(img)
+        loss = criterion(out, kps)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+        loop.set_postfix(loss=loss.item())
+    train_loss /= len(train_loader)
+
+    # 验证  收集所有预测和真值计算 RMSE
+    model.eval()
+    all_pred, all_true = [], []
+    with torch.no_grad():
+        for img, kps in val_loader:
+            img, kps = img.to(device), kps.to(device)
+            out = model(img)
+            all_pred.append(out.cpu())
+            all_true.append(kps.cpu())
+    all_pred = torch.cat(all_pred)
+    all_true = torch.cat(all_true)
+    val_mse = nn.functional.mse_loss(all_pred, all_true)
+    val_rmse_norm = torch.sqrt(val_mse).item()
+    val_rmse_pixel = val_rmse_norm * 96.0   # 转换为像素误差
+
+    tqdm.write(f"Epoch {epoch+1:2d}/{EPOCHS} | Train MSE: {train_loss:.6f} | Val RMSE (pixel): {val_rmse_pixel:.4f}")
+    scheduler.step(val_rmse_norm)
+
+    # 保存最佳模型   早停（15轮
+    if val_rmse_pixel < best_rmse_pixel:
+        best_rmse_pixel = val_rmse_pixel
+        torch.save(model.state_dict(), 'best_model.pth')
+        tqdm.write(f" *** Best RMSE (pixel): {best_rmse_pixel:.4f} ***")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= 15:
+            tqdm.write(f"Early stopping at epoch {epoch+1}")
+            break
