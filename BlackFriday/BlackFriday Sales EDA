@@ -1,0 +1,61 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+file_path = '/black-friday-sales-eda/train.csv'
+df = pd.read_csv(file_path)
+
+print("行数列数:", df.shape)
+df.info()
+print("缺失:\n", df.isnull().sum())
+print("重复:", df.duplicated().sum())
+
+
+df_clean = df.copy()
+# 分类缺失补个 -1，当‘其他’
+df_clean['Product_Category_2'] = df_clean['Product_Category_2'].fillna(-1)
+df_clean['Product_Category_3'] = df_clean['Product_Category_3'].fillna(-1)
+# 字符串两边空格都去掉，统一格式
+for col in df_clean.select_dtypes(include=['object']).columns:
+    df_clean[col] = df_clean[col].str.strip()
+
+# 男生女生谁更能买
+gender_purchase = df_clean.groupby('Gender')['Purchase'].sum().sort_values(ascending=False)
+sns.barplot(x=gender_purchase.index, y=gender_purchase.values)
+plt.title('男生女生消费总额对比')
+plt.ylabel('总消费金额 ($)')
+plt.show()
+
+# 年龄段
+age_purchase = df_clean.groupby('Age')['Purchase'].sum().sort_values(ascending=False)
+sns.barplot(x=age_purchase.index, y=age_purchase.values)
+plt.title('各年龄段总消费')
+plt.ylabel('总消费金额 ($)')
+plt.xticks(rotation=45)
+plt.show()
+
+# 不同类别城市
+city_purchase = df_clean.groupby('City_Category')['Purchase'].sum().sort_values(ascending=False)
+sns.barplot(x=city_purchase.index, y=city_purchase.values)
+plt.title('A/B/C三类城市总消费对比')
+plt.ylabel('总消费金额 ($)')
+plt.show()
+
+# 爆款单品 Top10
+product_purchase = df_clean.groupby('Product_ID')['Purchase'].sum().sort_values(ascending=False).head(10)
+print("\n卖得最好的10个单品 ID 和销售额:\n", product_purchase)
+
+# 哪类商品最吸金（一级分类）
+cat1_purchase = df_clean.groupby('Product_Category_1')['Purchase'].sum().sort_values(ascending=False).head(10)
+print("\n最赚钱的10个一级品类:\n", cat1_purchase)
+
+# 城市和年龄交叉
+pivot_table = pd.crosstab(df_clean['City_Category'], df_clean['Age'], 
+                          values=df_clean['Purchase'], aggfunc='sum')
+sns.heatmap(pivot_table, annot=True, fmt='.0f', cmap='YlGnBu')
+plt.title('不同城市 x 不同年龄段的消费热力图')
+plt.show()
+
